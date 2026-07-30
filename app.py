@@ -2524,15 +2524,48 @@ def render_validation_app() -> None:
 
 def get_supabase_repository() -> Optional[SupabaseRepository]:
     if create_client is None:
+        st.error(
+            "No se encuentra instalada la librería de Supabase. "
+            "Revisa requirements.txt."
+        )
         return None
+
     try:
         config = st.secrets["supabase"]
-        url = config.get("url", "")
-        key = config.get("service_role_key", "")
-        if not url or not key:
+
+        url = str(config.get("url", "")).strip().rstrip("/")
+        key = str(config.get("secret_key", "")).strip()
+
+        if not url:
+            st.error("Falta configurar supabase.url en Streamlit Secrets.")
             return None
-        return SupabaseRepository(create_client(url, key))
-    except Exception:
+
+        if not key:
+            st.error(
+                "Falta configurar supabase.secret_key "
+                "en Streamlit Secrets."
+            )
+            return None
+
+        if not key.startswith("sb_secret_"):
+            st.error(
+                "La clave configurada no es una Secret key de Supabase. "
+                "Debe comenzar con 'sb_secret_'. No utilices "
+                "'sb_publishable_' ni la clave anon."
+            )
+            return None
+
+        client = create_client(url, key)
+        return SupabaseRepository(client)
+
+    except KeyError:
+        st.error(
+            "No existe la sección [supabase] en Streamlit Secrets."
+        )
+        return None
+
+    except Exception as exc:
+        st.error(f"No fue posible conectar con Supabase: {exc}")
         return None
 
 

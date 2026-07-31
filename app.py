@@ -17,7 +17,9 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from weekly_control import (
     DEFAULT_EXCLUSIONS,
     SupabaseRepository,
+    candidate_work_order_turn,
     daily_summary,
+    normalize_equipment,
     normalize_text as normalize_weekly_text,
     read_detentions_excel,
     similarity,
@@ -2658,7 +2660,21 @@ def render_weekly_control() -> None:
                     detention_file.getvalue(), detention_file.name, exclusions
                 )
                 imported = repo.upsert_detentions(det_df.to_dict("records"))
-                st.success(f"Se importaron o actualizaron {imported} detenciones.")
+
+                associated = 0
+                if not det_df.empty and "fecha_operacional" in det_df.columns:
+                    operational_dates = pd.to_datetime(
+                        det_df["fecha_operacional"], errors="coerce"
+                    ).dt.date.dropna()
+                    if not operational_dates.empty:
+                        associated = repo.auto_associate(
+                            operational_dates.min(), operational_dates.max()
+                        )
+
+                st.success(
+                    f"Se importaron o actualizaron {imported} detenciones. "
+                    f"Asociaciones automáticas realizadas: {associated}."
+                )
             except Exception as error:
                 st.error(f"No fue posible importar el reporte: {error}")
 
@@ -2667,9 +2683,21 @@ def render_weekly_control() -> None:
             validation_results = st.session_state.results["results"]
             records = work_order_records(validation_results)
             imported = repo.upsert_work_orders(records)
-            reference = date.today()
-            start, end = week_bounds(reference)
-            associated = repo.auto_associate(start - timedelta(days=30), end)
+
+            operational_dates = [
+                pd.to_datetime(record.get("fecha_operacional"), errors="coerce")
+                for record in records
+                if record.get("fecha_operacional")
+            ]
+            operational_dates = [value.date() for value in operational_dates if pd.notna(value)]
+            if operational_dates:
+                association_start = min(operational_dates) - timedelta(days=1)
+                association_end = max(operational_dates) + timedelta(days=1)
+            else:
+                association_start, association_end = week_bounds(date.today())
+                association_start -= timedelta(days=30)
+
+            associated = repo.auto_associate(association_start, association_end)
             st.success(
                 f"Se guardaron o actualizaron {imported} OT digitales. "
                 f"Asociaciones automáticas realizadas: {associated}."
@@ -2690,6 +2718,9 @@ def render_weekly_control() -> None:
         refresh = st.button("Actualizar datos", use_container_width=True, key="refresh_weekly")
 
     try:
+        if refresh:
+            repo.auto_associate(start_date, end_date)
+
         detentions = repo.list_detentions(start_date, end_date)
         detention_ids = detentions["id"].tolist() if not detentions.empty else []
         associations = repo.list_associations(detention_ids)
@@ -2755,10 +2786,20 @@ def render_weekly_control() -> None:
     if pending.empty:
         st.success("No existen detenciones pendientes de OT en el período seleccionado.")
     else:
+        # El turno mostrado en este detalle proviene exclusivamente de la OT
+        # candidata guardada en Supabase (celda G19 del formato OT). El reporte
+        # de detenciones no se utiliza para completar este campo.
+        pending_turns = pending.apply(
+            lambda row: candidate_work_order_turn(row.to_dict(), ots),
+            axis=1,
+        )
         pending_display = pd.DataFrame({
-            "Fecha": pd.to_datetime(pending["fecha_detencion"], errors="coerce").dt.strftime("%d/%m/%Y"),
+            "Fecha": pd.to_datetime(
+                pending.get("fecha_operacional", pending["fecha_detencion"]),
+                errors="coerce",
+            ).dt.strftime("%d/%m/%Y"),
             "Hora": pending.get("hora_inicio", "").fillna("").astype(str).str.slice(0, 5),
-            "Turno": pending.get("turno", "").fillna(""),
+            "Turno": pending_turns,
             "Equipo": pending.get("equipo", "").fillna(""),
             "Descripción / Razón": pending.get("razon", "").fillna(""),
             "Comentario": pending.get("comentario", "").fillna(""),
@@ -2767,7 +2808,8 @@ def render_weekly_control() -> None:
 
         with st.expander("Asociar manualmente una OT pendiente"):
             detention_options = {
-                f"{row.get('fecha_detencion', '')} {str(row.get('hora_inicio', ''))[:5]} | "
+                f"{row.get('fecha_operacional') or row.get('fecha_detencion', '')} "
+                f"{str(row.get('hora_inicio', ''))[:5]} | "
                 f"{row.get('equipo', '')} | {row.get('razon', '')}": row.get("id")
                 for _, row in pending.iterrows()
             }
@@ -2780,8 +2822,8 @@ def render_weekly_control() -> None:
             available_ots = ots.copy()
             if not available_ots.empty:
                 available_ots = available_ots[
-                    available_ots["equipo"].apply(normalize_weekly_text)
-                    == normalize_weekly_text(selected_detention.get("equipo"))
+                    available_ots["equipo"].apply(normalize_equipment)
+                    == normalize_equipment(selected_detention.get("equipo"))
                 ]
             if available_ots.empty:
                 st.info("No hay OT digitales guardadas para este equipo.")
@@ -2841,4 +2883,3 @@ if module == "Validación OT":
     render_validation_app()
 else:
     render_weekly_control()
-

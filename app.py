@@ -830,6 +830,13 @@ def validate_work_order(
     tecnico_responsable = first_filled(ws, ["BD239"])
     motivo_detencion = normalize_value(get_value(ws, "AB25"))
 
+    # Fecha y hora operacionales de la OT. OpenPyXL entrega correctamente
+    # tanto horarios de 24 horas como valores mostrados en AM/PM.
+    fecha_inicio_ot = get_value(ws, "X9")
+    hora_inicio_ot = get_value(ws, "AB9")
+    fecha_termino_ot = get_value(ws, "X11")
+    hora_termino_ot = get_value(ws, "AB11")
+
     descripcion_partes: List[str] = []
     if motivo_detencion:
         descripcion_partes.append(motivo_detencion)
@@ -861,6 +868,10 @@ def validate_work_order(
         "Jefe de turno": jefe_turno,
         "Motivo detención": motivo_detencion,
         "Descripción OT": descripcion_ot,
+        "Fecha inicio OT": fecha_inicio_ot,
+        "Hora inicio OT": hora_inicio_ot,
+        "Fecha término OT": fecha_termino_ot,
+        "Hora término OT": hora_termino_ot,
         "Campos faltantes": len(missing),
         "Faltantes críticos": critical_missing,
         "Estado": "Completa" if not missing else "Con observaciones",
@@ -2525,47 +2536,38 @@ def render_validation_app() -> None:
 def get_supabase_repository() -> Optional[SupabaseRepository]:
     if create_client is None:
         st.error(
-            "No se encuentra instalada la librería de Supabase. "
-            "Revisa requirements.txt."
+            "No está instalada la librería de Supabase. "
+            "Revisa el archivo requirements.txt."
         )
         return None
 
     try:
         config = st.secrets["supabase"]
-
         url = str(config.get("url", "")).strip().rstrip("/")
-        key = str(config.get("secret_key", "")).strip()
+        key = str(
+            config.get("secret_key", "")
+            or config.get("service_role_key", "")
+        ).strip()
 
         if not url:
             st.error("Falta configurar supabase.url en Streamlit Secrets.")
             return None
-
         if not key:
-            st.error(
-                "Falta configurar supabase.secret_key "
-                "en Streamlit Secrets."
-            )
+            st.error("Falta configurar supabase.secret_key en Streamlit Secrets.")
             return None
-
         if not key.startswith("sb_secret_"):
             st.error(
-                "La clave configurada no es una Secret key de Supabase. "
-                "Debe comenzar con 'sb_secret_'. No utilices "
-                "'sb_publishable_' ni la clave anon."
+                "La clave configurada debe ser una Secret key de Supabase "
+                "y comenzar con 'sb_secret_'."
             )
             return None
 
-        client = create_client(url, key)
-        return SupabaseRepository(client)
-
+        return SupabaseRepository(create_client(url, key))
     except KeyError:
-        st.error(
-            "No existe la sección [supabase] en Streamlit Secrets."
-        )
+        st.error("No se encontró la sección [supabase] en Streamlit Secrets.")
         return None
-
-    except Exception as exc:
-        st.error(f"No fue posible conectar con Supabase: {exc}")
+    except Exception as error:
+        st.error(f"No fue posible conectar con Supabase: {error}")
         return None
 
 
@@ -2637,7 +2639,7 @@ def render_weekly_control() -> None:
             )
         st.code(
             '[supabase]\nurl = "https://TU-PROYECTO.supabase.co"\n'
-            'service_role_key = "TU_SERVICE_ROLE_KEY"',
+            'secret_key = "TU_SECRET_KEY"',
             language="toml",
         )
         st.info(

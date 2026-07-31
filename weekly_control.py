@@ -7,12 +7,17 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
-from openpyxl import load_workbook
 
 DEFAULT_EXCLUSIONS = ["LAVADO", "NEUMATICO", "AUTOMATIZACION", "CAMARA"]
+
+# Palabras poco discriminantes para comparar descripciones técnicas.
+_TEXT_STOPWORDS = {
+    "DE", "DEL", "LA", "LAS", "EL", "LOS", "Y", "EN", "A", "AL", "POR",
+    "PARA", "CON", "SE", "REALIZA", "REALIZAR", "TRABAJO", "EQUIPO",
+}
 
 
 def normalize_text(value: Any) -> str:
@@ -31,14 +36,47 @@ def safe_text(value: Any) -> str:
     return str(value).strip()
 
 
+def normalize_equipment(value: Any) -> str:
+    """
+    Convierte variantes del código de equipo a una clave comparable.
+
+    Ejemplos:
+    - TO-28_D10T2 -> TO28
+    - TO-28       -> TO28
+    - MO-10_2     -> MO10
+    - TN 17       -> TN17
+    """
+    text = normalize_text(value).replace(" ", "")
+    if not text:
+        return ""
+
+    # El formato OT puede incorporar turno o sufijos después de _ o /.
+    text = re.split(r"[_/\\]", text, maxsplit=1)[0]
+    text = re.sub(r"[^A-Z0-9]", "", text)
+
+    match = re.match(r"^([A-Z]+)0*(\d+)", text)
+    if not match:
+        return text
+
+    prefix, numeric = match.groups()
+    number = str(int(numeric))
+    if len(number) < 2:
+        number = number.zfill(2)
+    return f"{prefix}{number}"
+
+
 def _find_column(columns: Sequence[Any], aliases: Sequence[str]) -> Optional[Any]:
     normalized = {normalize_text(col): col for col in columns}
     for alias in aliases:
-        if normalize_text(alias) in normalized:
-            return normalized[normalize_text(alias)]
+        match = normalized.get(normalize_text(alias))
+        if match is not None:
+            return match
+
+    # Solo se usa búsqueda parcial para alias de más de un carácter.
+    long_aliases = [normalize_text(alias) for alias in aliases if len(normalize_text(alias)) > 1]
     for col in columns:
         ncol = normalize_text(col)
-        if any(normalize_text(alias) in ncol for alias in aliases):
+        if any(alias in ncol for alias in long_aliases):
             return col
     return None
 
@@ -64,8 +102,58 @@ def _parse_time(value: Any) -> time:
     if isinstance(value, (float, int)) and 0 <= float(value) < 1:
         seconds = int(round(float(value) * 86400)) % 86400
         return (datetime.min + timedelta(seconds=seconds)).time()
-    parsed = pd.to_datetime(str(value), errors="coerce")
+
+    text = safe_text(value)
+    for fmt in ("%I:%M %p", "%I:%M:%S %p", "%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(text.upper(), fmt).time()
+        except ValueError:
+            pass
+
+    parsed = pd.to_datetime(text, errors="coerce")
     return time(0, 0) if pd.isna(parsed) else parsed.time().replace(microsecond=0)
+
+
+def _parse_duration_seconds(value: Any) -> int:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0
+    if isinstance(value, timedelta):
+        return max(0, int(round(value.total_seconds())))
+    if isinstance(value, time):
+        return value.hour * 3600 + value.minute * 60 + value.second
+    if isinstance(value, (float, int)):
+        # Excel almacena las duraciones como fracción de día; 1 equivale a 24 h.
+        return max(0, int(round(float(value) * 86400)))
+
+    text = safe_text(value)
+    match = re.fullmatch(r"(\d+):(\d{1,2}):(\d{1,2})", text)
+    if match:
+        hours, minutes, seconds = map(int, match.groups())
+        return max(0, hours * 3600 + minutes * 60 + seconds)
+
+    parsed = pd.to_timedelta(text, errors="coerce")
+    return 0 if pd.isna(parsed) else max(0, int(round(parsed.total_seconds())))
+
+
+def _combine_datetime(date_value: Any, time_value: Any) -> Optional[datetime]:
+    parsed_date = _parse_date(date_value)
+    if parsed_date is None:
+        return None
+    return datetime.combine(parsed_date, _parse_time(time_value))
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if value is None or safe_text(value) == "":
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    result = parsed.to_pydatetime()
+    if result.tzinfo is not None:
+        result = result.replace(tzinfo=None)
+    return result
 
 
 def _identifier(*parts: Any) -> str:
@@ -82,6 +170,15 @@ def read_detentions_excel(file_bytes: bytes, filename: str, exclusions: Sequence
     col_equipo = _find_column(df.columns, ["Equipo"])
     col_fecha = _find_column(df.columns, ["Fecha"])
     col_hora = _find_column(df.columns, ["Hora", "Hora inicio"])
+    col_duracion = _find_column(df.columns, ["Duración", "Duracion"])
+
+    # La columna H del reporte representa la hora de término. Se busca de forma exacta
+    # para no confundirla con columnas que simplemente contienen la letra H.
+    normalized_columns = {normalize_text(col): col for col in df.columns}
+    col_hora_termino = normalized_columns.get("H")
+    if col_hora_termino is None:
+        col_hora_termino = _find_column(df.columns, ["Hora término", "Hora termino", "Hora fin"])
+
     col_razon = _find_column(df.columns, ["Razón", "Razon", "Descripción", "Descripcion"])
     col_comentario = _find_column(df.columns, ["Comentarios", "Comentario"])
     col_categoria = _find_column(df.columns, ["Categoría", "Categoria"])
@@ -104,11 +201,24 @@ def read_detentions_excel(file_bytes: bytes, filename: str, exclusions: Sequence
 
     for _, row in df.iterrows():
         equipo = safe_text(row.get(col_equipo))
+        equipo_normalizado = normalize_equipment(equipo)
         fecha = _parse_date(row.get(col_fecha))
-        if not equipo or fecha is None:
+        if not equipo or not equipo_normalizado or fecha is None:
             continue
+
         hora = _parse_time(row.get(col_hora)) if col_hora else time(0, 0)
         fecha_hora = datetime.combine(fecha, hora)
+        duration_seconds = _parse_duration_seconds(row.get(col_duracion)) if col_duracion else 0
+
+        fecha_hora_termino: Optional[datetime] = None
+        if duration_seconds > 0:
+            fecha_hora_termino = fecha_hora + timedelta(seconds=duration_seconds)
+        elif col_hora_termino:
+            hora_termino = _parse_time(row.get(col_hora_termino))
+            fecha_hora_termino = datetime.combine(fecha, hora_termino)
+            if fecha_hora_termino <= fecha_hora:
+                fecha_hora_termino += timedelta(days=1)
+
         razon = safe_text(row.get(col_razon))
         comentario = safe_text(row.get(col_comentario)) if col_comentario else ""
         categoria = safe_text(row.get(col_categoria)) if col_categoria else ""
@@ -120,11 +230,15 @@ def read_detentions_excel(file_bytes: bytes, filename: str, exclusions: Sequence
         requiere_ot = not bool(exclusion)
 
         records.append({
-            "identificador": _identifier(equipo, fecha_hora.isoformat(), razon, comentario),
+            "identificador": _identifier(equipo_normalizado, fecha_hora.isoformat(), razon, comentario),
             "equipo": equipo,
+            "equipo_normalizado": equipo_normalizado,
             "fecha_detencion": fecha.isoformat(),
             "hora_inicio": hora.strftime("%H:%M:%S"),
             "fecha_hora_inicio": fecha_hora.isoformat(),
+            "hora_termino": fecha_hora_termino.time().strftime("%H:%M:%S") if fecha_hora_termino else None,
+            "fecha_hora_termino": fecha_hora_termino.isoformat() if fecha_hora_termino else None,
+            "duracion_segundos": duration_seconds,
             "turno": turno,
             "codigo": codigo,
             "razon": razon,
@@ -141,36 +255,159 @@ def read_detentions_excel(file_bytes: bytes, filename: str, exclusions: Sequence
     return pd.DataFrame(records)
 
 
-def work_order_records(validation_results: Sequence[Dict[str, Any]], received_at: Optional[datetime] = None) -> List[Dict[str, Any]]:
+def work_order_records(
+    validation_results: Sequence[Dict[str, Any]],
+    received_at: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
     received_at = received_at or datetime.now()
     records: List[Dict[str, Any]] = []
+
     for result in validation_results:
         ot_number = safe_text(result.get("Orden"))
         if not ot_number:
             ot_number = f"SIN-NUMERO-{_identifier(result.get('Archivo'), result.get('Equipo'))[:12]}"
+
+        equipo = safe_text(result.get("Equipo"))
         description = safe_text(result.get("Descripción OT")) or safe_text(result.get("Motivo detención"))
+
+        start_dt = _combine_datetime(
+            result.get("Fecha inicio OT"),
+            result.get("Hora inicio OT"),
+        )
+        end_dt = _combine_datetime(
+            result.get("Fecha término OT"),
+            result.get("Hora término OT"),
+        )
+        if start_dt and end_dt and end_dt < start_dt:
+            end_dt += timedelta(days=1)
+
         records.append({
             "numero_ot": ot_number,
-            "equipo": safe_text(result.get("Equipo")),
+            "equipo": equipo,
+            "equipo_normalizado": normalize_equipment(equipo),
             "turno": safe_text(result.get("Turno")),
             "descripcion": description,
             "descripcion_normalizada": normalize_text(description),
+            "fecha_inicio": start_dt.date().isoformat() if start_dt else None,
+            "hora_inicio": start_dt.time().strftime("%H:%M:%S") if start_dt else None,
+            "fecha_hora_inicio": start_dt.isoformat() if start_dt else None,
+            "fecha_termino": end_dt.date().isoformat() if end_dt else None,
+            "hora_termino": end_dt.time().strftime("%H:%M:%S") if end_dt else None,
+            "fecha_hora_termino": end_dt.isoformat() if end_dt else None,
             "archivo_origen": safe_text(result.get("Archivo")),
             "fecha_recepcion": received_at.date().isoformat(),
             "fecha_hora_recepcion": received_at.isoformat(),
             "estado_validacion": safe_text(result.get("Estado")),
             "campos_faltantes": int(result.get("Campos faltantes", 0) or 0),
         })
+
     return records
 
 
-def similarity(detention: Dict[str, Any], ot: Dict[str, Any]) -> float:
-    if normalize_text(detention.get("equipo")) != normalize_text(ot.get("equipo")):
+def _tokenize_description(value: Any) -> set[str]:
+    text = normalize_text(value)
+    tokens: set[str] = set()
+    for token in re.findall(r"[A-Z0-9]+", text):
+        if token in _TEXT_STOPWORDS or len(token) <= 1:
+            continue
+        # Normalización básica de plural para FILTROS/FILTRO, MANGUERAS/MANGUERA, etc.
+        if token.endswith("ES") and len(token) > 5:
+            token = token[:-2]
+        elif token.endswith("S") and len(token) > 4:
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
+
+
+def _text_similarity(a: Any, b: Any) -> float:
+    text_a = normalize_text(a)
+    text_b = normalize_text(b)
+    if not text_a or not text_b:
         return 0.0
-    a = normalize_text(detention.get("descripcion_normalizada") or detention.get("razon"))
-    b = normalize_text(ot.get("descripcion_normalizada") or ot.get("descripcion"))
-    text_score = SequenceMatcher(None, a, b).ratio() if a and b else 0.0
-    return round(0.35 + 0.65 * text_score, 4)
+
+    sequence = SequenceMatcher(None, text_a, text_b).ratio()
+    tokens_a = _tokenize_description(text_a)
+    tokens_b = _tokenize_description(text_b)
+    if not tokens_a or not tokens_b:
+        return sequence
+
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    jaccard = intersection / union if union else 0.0
+    containment = intersection / min(len(tokens_a), len(tokens_b))
+    return max(sequence, jaccard, containment)
+
+
+def _temporal_similarity(detention: Dict[str, Any], ot: Dict[str, Any]) -> Optional[float]:
+    det_start = _parse_iso_datetime(detention.get("fecha_hora_inicio"))
+    det_end = _parse_iso_datetime(detention.get("fecha_hora_termino"))
+    ot_start = _parse_iso_datetime(ot.get("fecha_hora_inicio"))
+    ot_end = _parse_iso_datetime(ot.get("fecha_hora_termino"))
+
+    if det_start is None or ot_start is None:
+        return None
+
+    if det_end is None:
+        det_end = det_start
+    if ot_end is None:
+        ot_end = ot_start
+
+    # Corrige cruces de medianoche si una fuente solo entregó horas.
+    if det_end < det_start:
+        det_end += timedelta(days=1)
+    if ot_end < ot_start:
+        ot_end += timedelta(days=1)
+
+    # Superposición real de intervalos: señal temporal más fuerte.
+    if max(det_start, ot_start) <= min(det_end, ot_end):
+        return 1.0
+
+    if ot_start > det_end:
+        gap_hours = (ot_start - det_end).total_seconds() / 3600
+    else:
+        gap_hours = (det_start - ot_end).total_seconds() / 3600
+
+    gap_hours = abs(gap_hours)
+    if gap_hours <= 1:
+        return 0.90
+    if gap_hours <= 3:
+        return 0.75
+    if gap_hours <= 6:
+        return 0.55
+    if gap_hours <= 12:
+        return 0.35
+    if det_start.date() == ot_start.date():
+        return 0.25
+    if abs((det_start.date() - ot_start.date()).days) <= 1:
+        return 0.10
+    return 0.0
+
+
+def similarity(detention: Dict[str, Any], ot: Dict[str, Any]) -> float:
+    det_equipment = normalize_equipment(
+        detention.get("equipo_normalizado") or detention.get("equipo")
+    )
+    ot_equipment = normalize_equipment(
+        ot.get("equipo_normalizado") or ot.get("equipo")
+    )
+    if not det_equipment or det_equipment != ot_equipment:
+        return 0.0
+
+    det_description = detention.get("descripcion_normalizada") or " ".join(
+        [safe_text(detention.get("razon")), safe_text(detention.get("comentario"))]
+    )
+    ot_description = ot.get("descripcion_normalizada") or ot.get("descripcion")
+    text_score = _text_similarity(det_description, ot_description)
+    temporal_score = _temporal_similarity(detention, ot)
+
+    if temporal_score is None:
+        # Sin fecha/hora de OT: equipo + descripción.
+        score = 0.35 + 0.65 * text_score
+    else:
+        # Con fecha/hora: la superposición operacional tiene mayor peso.
+        score = 0.55 * temporal_score + 0.45 * text_score
+
+    return round(min(1.0, score), 4)
 
 
 def week_bounds(reference: date) -> Tuple[date, date]:
@@ -259,36 +496,68 @@ class SupabaseRepository:
         ).execute()
         self.client.table("detenciones").update({"estado": "CON_OT"}).eq("id", detention_id).execute()
 
-    def auto_associate(self, start: date, end: date, threshold: float = 0.72) -> int:
+    def auto_associate(self, start: date, end: date, threshold: float = 0.70) -> int:
         detentions = self.list_detentions(start, end)
         if detentions.empty:
             return 0
-        associations = self.list_associations(detentions["id"].tolist())
-        associated_ids = set(associations.get("detencion_id", pd.Series(dtype=object)).astype(str)) if not associations.empty else set()
-        pending = detentions[
+
+        valid_detentions = detentions[
             detentions["requiere_ot"].fillna(False).astype(bool)
-            & ~detentions["id"].astype(str).isin(associated_ids)
-        ]
-        ots = self.list_work_orders()
-        if pending.empty or ots.empty:
+        ].copy()
+        if valid_detentions.empty:
             return 0
 
-        used_pairs = set()
+        associations = self.list_associations()
+        already_associated_ot_ids = set()
+        if not associations.empty and "ot_id" in associations.columns:
+            already_associated_ot_ids = set(associations["ot_id"].dropna().astype(str))
+
+        ots = self.list_work_orders()
+        if ots.empty:
+            return 0
+        ots = ots[~ots["id"].astype(str).isin(already_associated_ot_ids)].copy()
+        if ots.empty:
+            return 0
+
         count = 0
         for _, ot in ots.iterrows():
-            candidates = pending[
-                pending["equipo"].apply(normalize_text) == normalize_text(ot.get("equipo"))
+            ot_equipment = normalize_equipment(
+                ot.get("equipo_normalizado") or ot.get("equipo")
+            )
+            candidates = valid_detentions[
+                valid_detentions.apply(
+                    lambda row: normalize_equipment(
+                        row.get("equipo_normalizado") or row.get("equipo")
+                    ) == ot_equipment,
+                    axis=1,
+                )
             ]
             if candidates.empty:
                 continue
-            scored = [(similarity(det.to_dict(), ot.to_dict()), det) for _, det in candidates.iterrows()]
+
+            ot_start = _parse_iso_datetime(ot.get("fecha_hora_inicio"))
+            if ot_start is not None:
+                candidate_dates = pd.to_datetime(
+                    candidates["fecha_detencion"], errors="coerce"
+                ).dt.date
+                candidates = candidates[
+                    candidate_dates.apply(
+                        lambda value: value is not None
+                        and abs((value - ot_start.date()).days) <= 2
+                    )
+                ]
+            if candidates.empty:
+                continue
+
+            scored = [
+                (similarity(det.to_dict(), ot.to_dict()), det)
+                for _, det in candidates.iterrows()
+            ]
             scored.sort(key=lambda item: item[0], reverse=True)
             best_score, best_det = scored[0]
-            unique_equipment_candidate = len(candidates) == 1
-            if best_score >= threshold or unique_equipment_candidate:
-                pair = (str(best_det["id"]), str(ot["id"]))
-                if pair not in used_pairs:
-                    self.associate(best_det["id"], ot["id"], best_score, "AUTOMATICA")
-                    used_pairs.add(pair)
-                    count += 1
+
+            if best_score >= threshold:
+                self.associate(best_det["id"], ot["id"], best_score, "AUTOMATICA")
+                count += 1
+
         return count

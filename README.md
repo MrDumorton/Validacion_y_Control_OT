@@ -101,10 +101,10 @@ El nuevo módulo permite:
 ```toml
 [supabase]
 url = "https://TU-PROYECTO.supabase.co"
-service_role_key = "TU_SERVICE_ROLE_KEY"
+secret_key = "TU_SECRET_KEY"
 ```
 
-La `service_role_key` debe mantenerse únicamente en Streamlit Secrets y nunca subirse al repositorio público.
+La `secret_key` (empieza con `sb_secret_`) debe mantenerse únicamente en Streamlit Secrets y nunca subirse al repositorio público. No uses la publishable key para este módulo, porque las tablas tienen RLS habilitado y la aplicación necesita operaciones de servidor.
 
 ### Flujo diario recomendado
 
@@ -114,3 +114,20 @@ La `service_role_key` debe mantenerse únicamente en Streamlit Secrets y nunca s
 4. Revisar el resumen diario y confirmar manualmente las asociaciones que no sean evidentes.
 
 Una detención puede tener varias OT relacionadas. Para el indicador diario, una detención se considera respaldada cuando tiene al menos una OT digital confirmada.
+
+## Corrección de asociación por equipo y horario
+
+La asociación automática ahora normaliza códigos como `TO-28_D10T2` a `TO28` y
+`MO-10_2` a `MO10`. Además, lee desde la OT las fechas y horas de inicio/término
+(`X9`, `AB9`, `X11`, `AB11`) y las compara contra el intervalo real de la detención.
+Los valores mostrados en AM/PM y los horarios de 24 horas se convierten al mismo
+objeto de fecha/hora antes de comparar.
+
+Para una base Supabase ya creada, ejecutar una vez en SQL Editor:
+
+```text
+supabase_migration_matching.sql
+```
+
+Después se deben volver a importar las detenciones y volver a guardar las OT para
+completar los nuevos campos de equipo normalizado e intervalo operacional.
